@@ -1,125 +1,153 @@
+const express = require("express");
+const crypto = require("crypto");
 
-const fs = require("node:fs");
-const path = require("node:path");
-const http = require("node:http");
+const app = express();
 
-const config = require("./config");
+const PORT = process.env.PORT || 3000;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const APP_SECRET = process.env.META_APP_SECRET;
+const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const GRAPH_VERSION = process.env.GRAPH_API_VERSION || "v26.0";
 
-const commands = new Map();
-const commandsDir = path.join(__dirname, "commands");
-const startedAt = Date.now();
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = Buffer.from(buf);
+  }
+}));
 
-function loadCommands() {
-  commands.clear();
-  fs.mkdirSync(commandsDir, { recursive: true });
+app.get("/", (req, res) => {
+  res.json({
+    bot: "AriYa'n Bot V4",
+    status: "online"
+  });
+});
 
-  for (const file of fs.readdirSync(commandsDir)) {
-    if (!file.endsWith(".js")) continue;
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "AriYa'n Bot V4"
+  });
+});
 
-    const fullPath = path.join(commandsDir, file);
+// Meta webhook verification
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
 
-    try {
-      delete require.cache[require.resolve(fullPath)];
-      const command = require(fullPath);
-
-      if (
-        !command.config?.name ||
-        typeof command.run !== "function"
-      ) {
-        console.warn(`[V4] Invalid command skipped: ${file}`);
-        continue;
-      }
-
-      commands.set(
-        command.config.name.toLowerCase(),
-        command
-      );
-
-      console.log(`[V4] Loaded: ${command.config.name}`);
-    } catch (error) {
-      console.error(`[V4] Failed to load ${file}:`, error.message);
-    }
+  if (
+    mode === "subscribe" &&
+    VERIFY_TOKEN &&
+    token === VERIFY_TOKEN
+  ) {
+    return res.status(200).send(challenge);
   }
 
-  console.log(`[V4] ${commands.size} command(s) loaded.`);
+  return res.sendStatus(403);
+});
+
+// Verify that webhook requests came from Meta
+function verifySignature(req) {
+  const signature = req.get("x-hub-signature-256");
+
+  if (!APP_SECRET || !signature || !req.rawBody) {
+    return false;
+  }
+
+  const expected =
+    "sha256=" +
+    crypto
+      .createHmac("sha256", APP_SECRET)
+      .update(req.rawBody)
+      .digest("hex");
+
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+
+  return a.length === b.length &&
+    crypto.timingSafeEqual(a, b);
 }
 
-// Adapter-independent message handler.
-// A future supported chat adapter can call this function.
-async function handleMessage({ senderID, body, reply, event = {} }) {
-  if (typeof body !== "string" || !body.startsWith(config.prefix)) {
+async function sendMessage(recipientId, text) {
+  if (!PAGE_TOKEN) {
+    throw new Error("PAGE_ACCESS_TOKEN is missing");
+  }
+
+  const url =
+    `https://graph.facebook.com/${GRAPH_VERSION}/me/messages`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${PAGE_TOKEN}`
+    },
+    body: JSON.stringify({
+      recipient: { id: recipientId },
+      messaging_type: "RESPONSE",
+      message: { text }
+    })
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Messenger API error: ${JSON.stringify(data)}`
+    );
+  }
+
+  return data;
+}
+
+async function handleMessage(event) {
+  const senderId = event.sender?.id;
+  const text = event.message?.text?.trim();
+
+  if (!senderId || !text || event.message?.is_echo) {
     return;
   }
 
-  const input = body.slice(config.prefix.length).trim();
-  if (!input) return;
+  const command = text.toLowerCase();
 
-  const [name, ...args] = input.split(/\s+/);
-  const command = commands.get(name.toLowerCase());
-
-  if (!command) {
-    return reply(`Unknown command: ${name}`);
+  if (command === "!ping") {
+    return sendMessage(senderId, "Pong! AriYa'n Bot V4 online.");
   }
 
-  const role = Number(command.config.role || 0);
-  const isAdmin = config.adminUIDs.includes(String(senderID));
-
-  if (role > 0 && !isAdmin) {
-    return reply("এই কমান্ডটি শুধু Admin ব্যবহার করতে পারবে।");
+  if (command === "!help") {
+    return sendMessage(
+      senderId,
+      "AriYa'n Bot V4\n\n!ping - Bot status\n!help - Commands"
+    );
   }
 
-  try {
-    await command.run({
-      args,
-      reply,
-      event,
-      config,
-      commands,
-      uptime: () => Math.floor((Date.now() - startedAt) / 1000)
-    });
-  } catch (error) {
-    console.error(`[V4] Command ${name} failed:`, error);
-    await reply("কমান্ড চালাতে সমস্যা হয়েছে। পরে আবার চেষ্টা করো।");
-  }
+  return sendMessage(
+    senderId,
+    "AriYa'n Bot V4 চালু আছে। কমান্ড দেখতে !help লিখুন।"
+  );
 }
 
-function startHealthServer() {
-  const port = Number(process.env.PORT || 3000);
+app.post("/webhook", (req, res) => {
+  if (!verifySignature(req)) {
+    return res.sendStatus(401);
+  }
 
-  const server = http.createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({
-        ok: true,
-        bot: config.name,
-        version: config.version,
-        commands: commands.size,
-        uptime: Math.floor((Date.now() - startedAt) / 1000)
-      }));
+  if (req.body?.object !== "page") {
+    return res.sendStatus(404);
+  }
+
+  // Acknowledge webhook delivery before processing messages.
+  res.sendStatus(200);
+
+  for (const entry of req.body.entry || []) {
+    for (const event of entry.messaging || []) {
+      handleMessage(event).catch(err => {
+        console.error("Message handler failed:", err.message);
+      });
     }
+  }
+});
 
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
-  });
-
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`[V4] Health server listening on ${port}`);
-  });
-
-  server.on("error", error => {
-    console.error("[V4] Health server error:", error.message);
-  });
-}
-
-loadCommands();
-startHealthServer();
-
-console.log(`[V4] ${config.name} core started.`);
-
-module.exports = {
-  config,
-  commands,
-  loadCommands,
-  handleMessage
-};
-
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`AriYa'n Bot V4 listening on port ${PORT}`);
+});
